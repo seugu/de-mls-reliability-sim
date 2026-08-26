@@ -58,6 +58,16 @@ class Config:
                                  # requesting the body (it may be in flight)
     max_bodyreq: int = 4         # max body-request attempts before giving up
     committee_ratio: float = 0.2 # fraction forming the control committee
+    apply_only_on_quorum: bool = False # never settle on a commit before its
+                                 # 2n/3 quorum forms; under <n/3 Byzantine the
+                                 # quorum is unique, so a short member stalls
+                                 # instead of forking
+    equivocate: bool = False     # malicious attesters equivocate a fabricated
+                                 # commit (C-EVIL) instead of staying silent
+    all_mint: bool = False       # RFC-faithful concurrent minting: every steward
+                                 # mints its own distinct commit at once (no
+                                 # primary-first ES/BS), members select over what
+                                 # they received. Exercised on the plain baseline.
     n_trials: int = 500          # random trials per run
     seed: int = 0                # base RNG seed (trial i uses seed+i)
     scenario: str = "plain"      # plain|reflexion|reflexion2|committee
@@ -109,6 +119,10 @@ class Participant:
         self.attested = False         # did we already send our own attestation?
         self.body_requested = False   # did we already send a body request?
         self.bodyreq_attempts = 0     # how many body requests we sent
+        # all-mint: the winner can shift as better candidates are learned, so we
+        # track which commit we last attested / requested rather than a bare flag
+        self.attested_cid = None      # commit id of our last attestation
+        self.body_req_cid = None      # commit id we last requested the body of
         self.log = []                 # (time, text) history for inspection
 
     def note(self, t, text):
@@ -126,6 +140,8 @@ class Simulator:
         self.seq = 0
         self.msg_count = 0            # every broadcast delivery attempt (drops incl.)
         self.byte_count = 0           # total bytes put on the wire (drops incl.)
+        self.last_change_time = 0.0   # sim time the group last changed a settled
+                                      # commit; the t=0 mints count, so start at 0
         self.participants = {}
         self.n = cfg.n_stewards + cfg.n_members
         self.quorum = quorum_size(cfg, self.n)
@@ -222,7 +238,8 @@ class Simulator:
         p = self.participants[ev.dst]
         p.seen_noes.add(ev.src)
         p.note(ev.time, f"recv NO-ES from {ev.src}")
-        if self.cfg.scenario == "reflexion2":
+        if self.cfg.scenario == "reflexion2" or (
+                self.cfg.all_mint and self.cfg.scenario == "committee"):
             self._deliver_noes_r2(p, ev.time)
             return
         if self.cfg.scenario != "reflexion":
@@ -252,7 +269,19 @@ class Simulator:
             p.note(ev.time, f"apply commit {best}")
 
     def _held_commit(self, p):
-        """Best commit a participant holds: prefer ES's, else BS's, else any."""
+        """Best commit a participant holds. all-mint (RFC concurrent minting):
+        the epoch steward's commit if held, else the smallest committer id among
+        those held -- the RFC selection collapses to this when every steward
+        commits the same proposals. Otherwise (primary-first): ES, then BS, else
+        any."""
+        if self.cfg.all_mint:
+            # Steward 0 is the epoch steward; its commit is "C-S0".
+            held = [c for c in p.commit_sources if c.startswith("C-S")]
+            if not held:
+                return None
+            if "C-S0" in held:
+                return "C-S0"
+            return min(held, key=lambda c: int(c[3:]))
         es_cid = "C-ES"
         bs_cid = "C-BS"
         if es_cid in p.commit_sources:
@@ -332,14 +361,66 @@ class Simulator:
             return p.id in self.committee
         return True
 
+    def _target_commit(self, p):
+        # all-mint: the deterministic winner among the candidates a member has
+        # heard of -- by body OR by attestation. Existence, not possession, sets
+        # the target, so learning a better candidate's attestation is enough to
+        # aim at it and then pull its body. Epoch steward (C-S0) is the smallest.
+        known = [c for c in set(p.commit_sources) | set(p.attest_sources)
+                 if c.startswith("C-S")]
+        if not known:
+            return None
+        return min(known, key=lambda c: int(c[3:]))
+
+    def _r2_progress(self, p, t):
+        # all-mint sync driver: aim a member at the current winner, and re-aim it
+        # as better candidates are learned. It attests the winner (spreading the
+        # winner's existence even when its body did not travel), pulls the
+        # winner's body if missing, and syncs once it holds the body and sees a
+        # quorum attesting it.
+        target = self._target_commit(p)
+        if target is None:
+            return
+        srcs = p.attest_sources.get(target, set())
+        if target in p.has_body and len(srcs) >= self._eff_quorum() and not p.synced:
+            p.synced = True
+            p.applied_commit = target
+            if p.diagnosis != "got-es":
+                p.diagnosis = "type3-netfail"
+            p.note(t, f"SYNCED on {target} (body + quorum)")
+            return
+        # Provisional apply of the winner we hold, unless quorum-gated. A member
+        # that already applied a worse candidate upgrades once it holds the
+        # winner's body; without the gate it never forks for good.
+        if (target in p.has_body and p.applied_commit != target
+                and not self.cfg.apply_only_on_quorum):
+            p.applied_commit = target
+            if target in p.commit_sources:
+                p.diagnosis = "got-es"
+        self._maybe_attest(p, t, target)
+        if target not in p.has_body and p.body_req_cid != target and not p.synced:
+            p.body_req_cid = target
+            p.bodyreq_attempts = 0
+            p.diagnosis = "type3-netfail"
+            self._push(t + self.cfg.bodyreq_grace, "BODYREQ_GRACE", p.id, p.id,
+                       {"commit_id": target})
+
     # ---- reflexion2 scenario (attestation + body pull) -----------------
     def _reflexion2_on_commit(self, p, ev):
+        if self.cfg.all_mint:
+            self._r2_progress(p, ev.time)
+            return
         # Got the ES body directly -> apply and attest.
         cid = ev.payload["commit_id"]
         if cid == "C-ES" and p.applied_commit is None:
-            p.applied_commit = "C-ES"
             p.diagnosis = "got-es"
-            p.note(ev.time, "have ES body -> apply C-ES")
+            # Normally a member applies the ES commit the moment it holds the
+            # body. Under apply_only_on_quorum it waits for the 2n/3 quorum, so a
+            # member short of a candidate stalls rather than applying a commit
+            # the group may not settle on.
+            if not self.cfg.apply_only_on_quorum:
+                p.applied_commit = "C-ES"
+                p.note(ev.time, "have ES body -> apply C-ES")
         # If we now hold the body and already have quorum attestations, sync.
         srcs = p.attest_sources.get(cid, set())
         if cid in p.has_body and len(srcs) >= self._eff_quorum() and not p.synced:
@@ -352,16 +433,36 @@ class Simulator:
         self._maybe_attest(p, ev.time, cid)
 
     def _maybe_attest(self, p, t, cid):
-        # Send a light ATTEST once, after a short suppression wait.
-        if p.attested or p.malicious or not self._can_attest(p):
+        # Send a light ATTEST after a short suppression wait. Primary-first
+        # attests once; all-mint may re-attest when the winner shifts to a
+        # better candidate (targets only decrease, so this is bounded).
+        if p.malicious or not self._can_attest(p):
             return
-        # schedule a suppression check: if quorum already reached by then, skip
+        if self.cfg.all_mint:
+            if p.attested_cid == cid:
+                return
+        elif p.attested:
+            return
         self._push(t + self.cfg.suppress_wait, "ATTEST_CHECK", p.id, p.id,
                    {"commit_id": cid})
 
     def _attest_check(self, ev):
         p = self.participants[ev.dst]
         cid = ev.payload["commit_id"]
+        if self.cfg.all_mint:
+            # Attest the current winner, which may have moved since this check
+            # was scheduled.
+            target = self._target_commit(p)
+            if target is None or p.attested_cid == target:
+                return
+            p.attested_cid = target
+            srcs = p.attest_sources.get(target, set())
+            if len(srcs) >= self._eff_quorum():
+                p.note(ev.time, f"suppressed ATTEST {target} (quorum already seen)")
+                return
+            self.broadcast(ev.time, p.id, ATTEST, {"commit_id": target})
+            p.note(ev.time, f"broadcast ATTEST {target}")
+            return
         if p.attested:
             return
         # Suppression: if we already see quorum attestations, don't add noise.
@@ -380,6 +481,10 @@ class Simulator:
         srcs = p.attest_sources.setdefault(cid, set())
         srcs.add(ev.src)
         p.note(ev.time, f"recv ATTEST {cid} from {ev.src} (distinct={len(srcs)})")
+
+        if self.cfg.all_mint:
+            self._r2_progress(p, ev.time)
+            return
 
         # If a commit is being attested but we lack its body, we will pull it,
         # but not immediately: the body may still be in flight. Schedule a grace
@@ -432,7 +537,14 @@ class Simulator:
         # Unicast keeps this cheap even if several holders answer.
         p = self.participants[ev.dst]
         cid = ev.payload["commit_id"]
-        if cid not in p.has_body or p.malicious:
+        if p.malicious:
+            # A Byzantine holder serves a fabricated body to anyone who asks for
+            # the equivocated commit. Only a member already fooled by a quorum of
+            # equivocations asks, which the <n/3 assumption rules out.
+            if self.cfg.equivocate and cid == "C-EVIL":
+                self.unicast(ev.time, p.id, ev.src, COMMIT, {"commit_id": cid})
+            return
+        if cid not in p.has_body:
             return
         self.unicast(ev.time, p.id, ev.src, COMMIT, {"commit_id": cid})
         p.note(ev.time, f"answer BODYREQ from {ev.src}: unicast body {cid}")
@@ -441,6 +553,23 @@ class Simulator:
         # reflexion2 deadline. If we hold the ES body, attest it (light).
         # If not, broadcast NO-ES so holders attest and quorum can form.
         p = self.participants[ev.dst]
+        if p.malicious and self.cfg.equivocate and self._can_attest(p):
+            # <n/3 assumption: a Byzantine attester may equivocate, attesting a
+            # commit it does not hold. It cannot reach a 2n/3 quorum without
+            # honest attesters, so the forgery only lands past the threshold.
+            p.attested = True
+            self.broadcast(ev.time, p.id, ATTEST, {"commit_id": "C-EVIL"})
+            p.note(ev.time, "malicious: equivocate ATTEST C-EVIL")
+            return
+        if self.cfg.all_mint:
+            # all-mint: aim at the winner among known candidates; if none reached
+            # us, announce NO-ES so holders attest and we learn one.
+            if self._target_commit(p) is None:
+                p.note(ev.time, "no candidate by deadline -> NO-ES")
+                self.broadcast(ev.time, p.id, NOES, {})
+            else:
+                self._r2_progress(p, ev.time)
+            return
         if "C-ES" in p.has_body:
             self._maybe_attest(p, ev.time, "C-ES")
             return
@@ -450,12 +579,19 @@ class Simulator:
         if p.role == "BS" and not p.sent_own_commit and "C-ES" not in p.has_body:
             p.sent_own_commit = True
             self.broadcast(ev.time, p.id, COMMIT, {"commit_id": "C-BS"})
-            p.applied_commit = "C-BS"
+            # The backup applies its own commit only when we let it settle before
+            # a quorum. Held to the quorum, it emits C-BS but waits, so it cannot
+            # strand itself on a commit the group settles against.
+            if not self.cfg.apply_only_on_quorum:
+                p.applied_commit = "C-BS"
             p.note(ev.time, "BS emits own body C-BS")
 
     def _deliver_noes_r2(self, p, t):
         # In reflexion2, a holder answers NO-ES by attesting (light), not by
         # resending the heavy body. Body travels only on explicit BODYREQ.
+        if self.cfg.all_mint:
+            self._r2_progress(p, t)
+            return
         if "C-ES" in p.has_body:
             self._maybe_attest(p, t, "C-ES")
 
@@ -470,17 +606,43 @@ class Simulator:
         # it as ES committing normally here; drops create the "afk-looking" case.
         # ES broadcasts its commit at t=0.
         es_afk = getattr(cfg, "_es_afk", False)
-        if not es_afk:
+        if cfg.all_mint:
+            # RFC concurrent minting: every steward mints its own commit at the
+            # same time. Each carries its own committer entropy, so the commits
+            # are distinct (distinct keys). A member settles on the best of the
+            # ones it receives; the ones it misses are what split the group.
+            for sid in range(cfg.n_stewards):
+                cid = f"C-S{sid}"
+                st = self.participants[sid]
+                st.commit_sources.setdefault(cid, set()).add(sid)
+                st.has_body.add(cid)
+                self.broadcast(0.0, sid, COMMIT, {"commit_id": cid})
+                if not cfg.apply_only_on_quorum:
+                    st.applied_commit = self._held_commit(st)
+                st.note(0.0, f"steward {sid} mints {cid}")
+        elif not es_afk:
             self.broadcast(0.0, es.id, COMMIT, {"commit_id": "C-ES"})
-            es.applied_commit = "C-ES"
-            es.synced = True
+            es.has_body.add("C-ES")
             es.diagnosis = "got-es"
+            # The committer settles on its own commit at once, unless we hold
+            # every member -- the ES included -- to the 2n/3 quorum. Then the ES
+            # waits too, so a lost round leaves it stalled with the rest instead
+            # of forked onto a commit no one else ever confirmed.
+            if not cfg.apply_only_on_quorum:
+                es.applied_commit = "C-ES"
+                es.synced = True
             es.note(0.0, "ES broadcast C-ES")
         else:
             es.note(0.0, "ES is AFK, no commit")
 
         # Scheduling of the "no ES commit by deadline" reaction.
-        if cfg.scenario == "reflexion":
+        if cfg.all_mint:
+            # With a sync layer every participant drives toward the winner at its
+            # deadline; plain all-mint has no reaction (the RFC baseline).
+            if cfg.scenario in ("reflexion2", "committee"):
+                for pid in self.participants:
+                    self._push(cfg.noes_wait, "R2_CHECK", pid, pid, {})
+        elif cfg.scenario == "reflexion":
             # everyone (except ES) may announce NO-ES and answer
             for pid, p in self.participants.items():
                 if pid == es.id:
@@ -503,6 +665,9 @@ class Simulator:
             ev = heapq.heappop(self.q)
             if ev.time > cfg.max_time:
                 break
+            # Snapshot settled commits so we can time convergence: the last event
+            # that moved any member's applied commit is when the group finished.
+            before = [p.applied_commit for p in self.participants.values()]
             if ev.kind == COMMIT:
                 self._deliver_commit(ev)
             elif ev.kind == NOES:
@@ -523,6 +688,8 @@ class Simulator:
                 self._bodyreq_grace(ev)
             elif ev.kind == "BS_DEADLINE":
                 self._bs_deadline(ev)
+            if [p.applied_commit for p in self.participants.values()] != before:
+                self.last_change_time = ev.time
 
         # Final diagnosis pass: a member that never got the commit and never
         # reached quorum concludes the ES was afk (type 2).
@@ -568,6 +735,7 @@ class Simulator:
             "distinct": distinct,
             "msg_count": self.msg_count,
             "byte_count": self.byte_count,
+            "convergence_time": self.last_change_time,
             "quorum": self.quorum,
             "n": self.n,
             "es_afk": es_afk,
@@ -588,6 +756,7 @@ def run_trials(cfg: Config, es_afk_prob: float = 0.0):
     total_msgs = 0
     total_bytes = 0
     tot_got_es = tot_type2 = tot_type3 = 0
+    conv_times = []               # convergence time, successful trials only
     for i in range(cfg.n_trials):
         rng = random.Random(cfg.seed + i)
         # optionally make ES afk in some fraction of trials
@@ -602,6 +771,7 @@ def run_trials(cfg: Config, es_afk_prob: float = 0.0):
         tot_type3 += res["type3"]
         if res["success"]:
             successes += 1
+            conv_times.append(res["convergence_time"])
         elif res["status"] == "FAIL-FORK":
             forks += 1
         elif res["status"] == "FAIL-STALL":
@@ -615,6 +785,9 @@ def run_trials(cfg: Config, es_afk_prob: float = 0.0):
         "success_rate": successes / t,
         "avg_msgs": total_msgs / t,
         "avg_bytes": total_bytes / t,
+        # mean sim time to converge, over successful trials (None if none)
+        "avg_convergence": (sum(conv_times) / len(conv_times)
+                            if conv_times else None),
         # average members per trial in each diagnosis bucket
         "avg_got_es": tot_got_es / t,
         "avg_type2": tot_type2 / t,
@@ -634,6 +807,15 @@ def build_argparser():
     ap.add_argument("--reflexion2", action="store_const", dest="scenario",
                     const="reflexion2",
                     help="optimized reflexion: light attest + body pull")
+    ap.add_argument("--committee", action="store_const", dest="scenario",
+                    const="committee",
+                    help="control-committee scenario (large-group optimization)")
+    ap.add_argument("--apply-only-on-quorum", action="store_true",
+                    help="never settle on a commit before its 2n/3 quorum")
+    ap.add_argument("--equivocate", action="store_true",
+                    help="malicious attesters equivocate a fabricated commit")
+    ap.add_argument("--all-mint", action="store_true",
+                    help="RFC concurrent minting: every steward mints at once")
     ap.add_argument("--stewards", type=int)
     ap.add_argument("--members", type=int)
     ap.add_argument("--p-loss", type=float)
@@ -654,6 +836,9 @@ def cfg_from_args(args):
     if args.malicious is not None: cfg.malicious_ratio = args.malicious
     if args.trials is not None: cfg.n_trials = args.trials
     if args.seed is not None: cfg.seed = args.seed
+    if args.apply_only_on_quorum: cfg.apply_only_on_quorum = True
+    if args.equivocate: cfg.equivocate = True
+    if args.all_mint: cfg.all_mint = True
     return cfg
 
 

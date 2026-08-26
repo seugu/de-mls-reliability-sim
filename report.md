@@ -173,10 +173,135 @@ large-group optimization; in small groups plain reflexion is more robust.
 - **Group size helps.** Reliability improves as the group grows, because
   redundancy grows; the hard cases are small groups at high loss.
 
+## Follow-up: safety knobs, the RFC model, and efficiency
+
+The scenarios above answer "does a sync mechanism help." A second round asks
+three sharper questions: where is the *safety* boundary, how faithful is the
+model to the RFC, and what does the RFC's commit collection *cost*. This added
+four parameters, one metric, and six self-checks.
+
+### Parameters added
+
+| flag (CLI) | in one line | what it is for |
+| --- | --- | --- |
+| `--apply-only-on-quorum` | Don't settle on any commit until a 2n/3 quorum has confirmed it | safety switch: trade forks for stalls |
+| `--equivocate` | Let a malicious member lie — attest a commit it does not hold | attack switch: probe the honest-majority limit |
+| `--all-mint` | Every steward mints its own commit at once (the RFC model), instead of one primary steward committing and a backup only on failure | make the model faithful to the RFC |
+| `--committee` | Only a deterministic committee attests (was already implemented, now reachable from the CLI) | large-group optimization |
+
+The **honest-majority assumption** is not a new flag — it is the existing
+`malicious_ratio` (`--malicious`). "At least 2n/3 honest" simply means
+`malicious_ratio <= 1/3`; the safety results hold only below that line.
+
+A metric was added too: `avg_convergence` — the mean sim time a group takes to
+settle, over successful trials (the "timer" axis).
+
+### Self-checks added (R12–R17)
+
+| id | claim | evidence |
+| --- | --- | --- |
+| R12 | quorum-gated apply removes the residual fork | forks 89 → **0** (but 400 stalls: safe, not free) |
+| R13 | a small committee is not safe by sampling | P(committee >= 1/3 Byz): n=12 **0.46** vs n=1000 **0.002** |
+| R14 | < n/3 Byzantine cannot forge a commit | honest applied C-EVIL: mal=1/3 → **0**, mal=0.7 → **220** |
+| R15 | RFC concurrent minting forks more than primary-first | forks **73 → 351** at the same loss |
+| R16 | the sync layer resolves the RFC fork | plain **13/285** → reflexion2 **300/0** (success/fork) |
+| R17 | all-mint costs messages, not time | msgs **157 → 241**, convergence **4.7s = 4.7s** |
+
+### The model vs. the RFC
+
+The original simulation is **primary-first**: one Epoch Steward commits, and a
+Backup commits only if it never saw the primary's commit. The RFC (§Commit
+validation service) is **concurrent**: "multiple stewards MAY issue commit
+messages within the same epoch," and each member "MUST locally ...
+deterministically [select] at most one valid commit" over **the commits it
+happened to receive** — with no mechanism specified to make those received sets
+equal.
+
+`--all-mint` implements the RFC model: every steward mints a distinct commit at
+once; members select the epoch steward's commit if held, else the smallest
+committer id (the RFC rule when all stewards carry the same proposals). The
+difference is stark and one-sided:
+
+| p_loss | primary-first forks | all-mint forks |
+| ---: | ---: | ---: |
+| 0.05 | 13 | **156** |
+| 0.10 | 36 | **262** |
+| 0.20 | 73 | **351** |
+| 0.30 | 113 | **384** |
+
+The success rate is the same in both — they differ only in *how they fail*.
+Primary-first fails **safe** (a member missing the commit has nothing to apply →
+stall); all-mint fails **unsafe** (a member almost always holds *some* steward's
+commit → applies a competitor → fork). So the original sim understated the real
+problem 3–12x. The fork surface is set by the steward count: at `sn=1` all-mint
+forks **0** (only stalls); `sn>=2` flips the failures almost entirely to forks.
+
+### Collection efficiency (messages + timers)
+
+Holding the sync layer constant and varying only the collection model:
+
+| measure | primary-first | all-mint |
+| --- | --- | --- |
+| plain, msgs | 12 | **33** |
+| reflexion2 p=0.1 — msgs / conv / success | 158 / 4.7s / 296 | **241** / 4.7s / **300** |
+| reflexion2 p=0.2 — msgs / conv / success | 198 / 5.9s / 272 | **264** / 5.9s / **300** |
+
+Commit traffic under all-mint scales linearly with the steward count
+(`sn * (n-1)`), while primary-first stays flat:
+
+| stewards | primary msgs | all-mint msgs |
+| ---: | ---: | ---: |
+| 1 | 11 | 11 |
+| 3 | 12 | 33 |
+| 6 | 12 | 66 |
+
+Two facts fall out: all-mint costs **more messages but the same convergence
+time** (latency is set by the attest+pull rounds, not by how many stewards
+minted), and the extra broadcasts **buy robustness** — all-mint reflexion2
+reaches 300/300 where primary-first gets 272, because the winner's body is
+redundantly held and served.
+
+### Main idea
+
+Three plain findings, each backed by a test above.
+
+1. **When every steward commits at once, one lost message forks the group.** In
+   the RFC model all stewards commit together, so a member that misses the
+   winning commit still holds someone else's and settles on that one — the group
+   splits for good. When only one steward commits (or `sn=1`), a member that
+   misses it has nothing to settle on and just waits, which is recoverable. The
+   same lost message forks the group in one model but only causes a harmless
+   wait in the other (R15: 73 → 351 forks). The number of stewards is the dial:
+   `sn=1` never forks, `sn=2` already does. The cheapest way to cut forks is
+   fewer stewards, not a longer timer.
+
+2. **The fix: tell everyone which commit won, cheaply, and let them fetch it.** A
+   member can only pick the right commit if it knows that commit exists. So
+   instead of re-sending the whole heavy commit, each holder sends a tiny note
+   carrying just its hash ("I have commit X"). That note is light enough to
+   reach everyone even under loss, so every member learns which commit is the
+   winner and then asks any holder to send that one body. Everyone lands on the
+   same commit, and it takes no longer than before (R16: forks go from 285 to 0;
+   R17: same 4.7s). This "small note, then fetch the body" step is exactly what
+   de-mls is missing today.
+
+3. **The obvious safety rule backfires.** "Don't apply a commit until 2/3 of
+   members confirm it" does stop forks — but under loss that confirmation often
+   never gathers, so the group freezes instead. At 30% loss it froze on every
+   run (0 success), while the note-and-fetch approach succeeded on every run
+   (300 success). The confirmation rule only pays off at extreme loss.
+
+**For de-mls:** build the small-note + fetch-the-body step. It is safe as long
+as fewer than a third of members are dishonest (R14: a forged commit cannot win
+below that line, only above it). Two easy wins come with it — keep the steward
+count small (each extra steward adds a full round of traffic, R17), and skip the
+longer timer and the strict confirmation rule, since neither adds safety this
+step does not already give.
+
 ## Files
 
 - `demls_sim.py` — the simulator (all four scenarios, config-driven).
-- `test_demls.py` — 11 self-checking requirements; all pass.
+- `test_demls.py` — 17 self-checking requirements; all pass.
 - `report.md` — this file.
 
 ## Running
@@ -189,6 +314,14 @@ python3 test_demls.py
 python3 demls_sim.py --plain      --p-loss 0.2 --stewards 3 --members 9  --trials 300
 python3 demls_sim.py --reflexion2 --p-loss 0.3 --stewards 3 --members 9  --trials 300
 python3 demls_sim.py --committee  --p-loss 0.01 --stewards 3 --members 997 --trials 5
+
+# RFC concurrent minting (all stewards mint at once); add a sync layer on top
+python3 demls_sim.py --plain      --all-mint --p-loss 0.2 --stewards 3 --members 9 --trials 300
+python3 demls_sim.py --reflexion2 --all-mint --p-loss 0.3 --stewards 3 --members 9 --trials 300
+
+# safety switches
+python3 demls_sim.py --reflexion2 --apply-only-on-quorum --p-loss 0.3 --trials 400
+python3 demls_sim.py --reflexion2 --equivocate --malicious 0.33 --trials 200
 ```
 
 Config lives in the `Config` dataclass in `demls_sim.py`, each field commented.
