@@ -196,7 +196,7 @@ The **honest-majority assumption** is not a new flag — it is the existing
 A metric was added too: `avg_convergence` — the mean sim time a group takes to
 settle, over successful trials (the "timer" axis).
 
-### Self-checks added (R12–R17)
+### Self-checks added (R12–R18)
 
 | id | claim | evidence |
 | --- | --- | --- |
@@ -206,6 +206,7 @@ settle, over successful trials (the "timer" axis).
 | R15 | RFC concurrent minting forks more than primary-first | forks **73 → 351** at the same loss |
 | R16 | the sync layer resolves the RFC fork | plain **13/285** → reflexion2 **300/0** (success/fork) |
 | R17 | all-mint costs messages, not time | msgs **157 → 241**, convergence **4.7s = 4.7s** |
+| R18 | the committee-safety formula matches real sampling | analytic **0.087** vs sampled **0.083** (and 0.197 vs 0.193) |
 
 ### The model vs. the RFC
 
@@ -301,8 +302,12 @@ step does not already give.
 ## Files
 
 - `demls_sim.py` — the simulator (all four scenarios, config-driven).
-- `test_demls.py` — 17 self-checking requirements; all pass.
+- `test_demls.py` — 18 self-checking requirements; all pass.
 - `report.md` — this file.
+- `measurements.py` — regenerates every comparison table (Findings 1–4).
+- `FINDINGS.md` — the design synthesis: collection, sync, and committee sizing.
+- `timing-and-adversary.md` — open notes on silent members and the delivery
+  deadline (Δ), and which parameters each affects.
 
 ## Running
 
