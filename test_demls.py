@@ -215,6 +215,45 @@ def main():
                          f"conv primary={pf['avg_convergence']:.1f}s "
                          f"all-mint={am['avg_convergence']:.1f}s"))
 
+    # R18: the analytic committee-safety tail matches sampled committees, so the
+    # k(f, eps) sizing table (Finding 4a) is measurement-backed, not just a
+    # formula. This is the probability a random committee is >= 1/3 Byzantine --
+    # the sizing input for a *voting* committee; it does not by itself cause a
+    # fork in the attestation sync (see FINDINGS Q-notes). The committee is
+    # deterministic, so build it once and sample only the malicious draw.
+    from math import lgamma, log, exp, ceil
+
+    def tail_unsafe(k, f):
+        thr = ceil(k / 3)
+        t = [lgamma(k + 1) - lgamma(i + 1) - lgamma(k - i + 1)
+             + i * log(f) + (k - i) * log(1 - f) for i in range(thr, k + 1)]
+        if not t:
+            return 0.0
+        m = max(t)
+        return exp(m) * sum(exp(x - m) for x in t)
+
+    def sampled_unsafe(k, f, n=600, trials=4000):
+        sim = Simulator(Config(n_stewards=1, n_members=n - 1,
+                               committee_ratio=k / n), random.Random(0))
+        comm = sim.committee
+        n_mal = round(f * n)
+        bad = 0
+        for i in range(trials):
+            mal = set(random.Random(9000 + i).sample(range(n), n_mal))
+            if len(comm & mal) / len(comm) >= 1 / 3:
+                bad += 1
+        return bad / trials
+
+    ok = True
+    detail = []
+    for k, f in [(20, 0.20), (30, 0.25)]:
+        a, m = tail_unsafe(k, f), sampled_unsafe(k, f)
+        detail.append(f"k={k},f={f}: analytic={a:.3f} vs sampled={m:.3f}")
+        if abs(a - m) > 0.03:
+            ok = False
+    results.append(check("R18 safety-table tail matches sampled committees",
+                         ok, "; ".join(detail)))
+
     print("-" * 60)
     if all(results):
         print(f"ALL {len(results)} REQUIREMENTS PASS")
